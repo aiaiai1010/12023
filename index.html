@@ -162,7 +162,7 @@
       </div>
       <p class="hint">
         使い方：<strong>測定開始</strong> → 良い姿勢で <strong>基準ボタン</strong> を押し、メッセージに従って3秒静止 →<br>
-        キャリブを押さない場合は固定しきい値で判定します（まっすぐは straight）。<br>
+        キャリブを押さない場合は「固定しきい値」で判定します。<br>
         不要なら <strong>解除</strong>。iOS は開始時にセンサー許可が必要です。
       </p>
 
@@ -359,7 +359,7 @@
       }
 
       // 顔向き & 距離の分類
-      const dir = classifyDirection();     // ← 判定ロジック修正済み
+      const dir = classifyDirection();     // ← ここを調整
       faceState.dir = dir;
       const prox = classifyProximity(sNoseZ);
       faceState.prox = prox;
@@ -376,7 +376,7 @@
         `Roll:  ${sRoll.toFixed(2)}°\n` +
         `yDiff(平滑): ${sYdiff.toFixed(4)}\n` +
         `noseZ(平滑): ${sNoseZ.toFixed(4)}\n` +
-        `combined(表示用): ${combined.toFixed(4)}\n` +
+        `combined: ${combined.toFixed(4)}\n` +
         `顔向き: ${faceState.dir}\n` +
         `顔距離: ${faceState.prox}`;
 
@@ -392,19 +392,18 @@
 
     // combined をデバッグ用に返す
     function getCombinedForDebug(){
-      // キャリブあり：yDiff + noseZ の差分
       if (PARAMS.calibYdiff != null && PARAMS.calibNoseZ != null){
         return (sYdiff - PARAMS.calibYdiff) + (sNoseZ - PARAMS.calibNoseZ);
       }
-      // キャリブ無し：わかりやすく yDiff のみ表示
-      return (sYdiff ?? 0);
+      // キャリブなし：実際に判定に使う combined と同じもの
+      return (sYdiff ?? 0) + (sNoseZ ?? 0);
     }
 
     // 顔向き判定ロジック
     function classifyDirection() {
       const band = PARAMS.absExitBand ?? 0.02;
 
-      // ★ キャリブ済みの場合：これまで通り combined(yDiff + noseZ) で up/down/straight
+      // ★ キャリブ済みの場合：元のロジックそのまま
       if (PARAMS.calibYdiff != null && PARAMS.calibNoseZ != null){
         let combined = (sYdiff - PARAMS.calibYdiff) + (sNoseZ - PARAMS.calibNoseZ);
 
@@ -419,20 +418,33 @@
         return 'straight';
       }
 
-      // ★ キャリブ無しの場合：yDiff だけで「下を向いたかどうか」だけを見る
-      const y = sYdiff ?? 0;
-      const downTh = 0.06; // ここは必要に応じて調整
+      // ★ キャリブ無しの場合：しきい値を広くして「ほぼ straight」にする
+      const combined = (sYdiff ?? 0) + (sNoseZ ?? 0);
+      const downTh = -0.06;   // これよりかなり小さいと down
+      const upTh   =  0.12;   // これよりかなり大きいと up
 
-      if (!wasDown && y > downTh) { // 顎が十分下がったら down
+      // down 判定
+      if (!wasDown && combined < downTh) {
         wasDown = true;
+        wasUp = false;
         return 'down';
       }
-      if (wasDown && y < downTh - band) { // 戻ってきたらフラグ解除
+      if (wasDown && combined > downTh + band) {
         wasDown = false;
       }
-      if (wasDown) return 'down';
 
-      // 基本的にニュートラルは全部 straight
+      // up 判定
+      if (!wasUp && combined > upTh) {
+        wasUp = true;
+        wasDown = false;
+        return 'up';
+      }
+      if (wasUp && combined < upTh - band) {
+        wasUp = false;
+      }
+
+      if (wasDown) return 'down';
+      if (wasUp)   return 'up';
       return 'straight';
     }
 
