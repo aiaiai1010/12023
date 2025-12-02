@@ -161,8 +161,8 @@
         </div>
       </div>
       <p class="hint">
-        使い方：<strong>測定開始</strong> → 良い姿勢で <strong>基準ボタン</strong> を押し、メッセージに従って3秒静止 →<br>
-        キャリブを押さない場合は「固定しきい値」で判定します。<br>
+        使い方：<strong>測定開始</strong> → 良い姿勢で <strong>基準ボタン</strong> を押すとその時の姿勢を基準にします。<br>
+        キャリブを押さない場合は「絶対値」のしきい値で判定します。<br>
         不要なら <strong>解除</strong>。iOS は開始時にセンサー許可が必要です。
       </p>
 
@@ -204,12 +204,10 @@
     const PARAMS = {
       alphaPitch: 0.25, alphaRoll: 0.25, alphaYdiff: 0.3, alphaNoseZ: 0.25,
       calibYdiff: null, calibNoseZ: null,
-      // しきい値
       absExitBand: 0.02,
       closeEnter: -0.035, closeExit: -0.015, farEnter: 0.020, farExit: 0.005,
       absCloseEnter: -0.15, absFarEnter: -0.10, absZExitBand: 0.02,
       sustainMs: 10, clearMs: 10,
-      // 警告音
       beep: { intervalMs: 500, freq: 880, dur: 0.3, gain: 0.08 },
     };
 
@@ -229,18 +227,13 @@
     let enterStart = null, exitStart  = null;
     let wasDown = false, wasUp = false, wasClose = false, wasFar = false;
 
-    // 3秒キャリブレーション状態
-    let calibMode = false;
-    let calibSamples = [];
-    let calibStartTs = 0;
+    // 顔検出フラグ
+    let faceDetected = false;
 
     // UI最適化
     let lastWarnText = null, lastWarnBad = null;
     let camera = null;
     let lastInferenceTs = 0; // FPS制限
-
-    // 顔検出フラグ
-    let faceDetected = false;
 
     // ======== 警告音（Web Audio） ========
     let audioCtx = null;
@@ -276,7 +269,7 @@
 
     function startBeepLoop() {
       if (beepInterval) return;
-      playBeep(); // 入りで1回
+      playBeep();
       beepInterval = setInterval(playBeep, PARAMS.beep.intervalMs);
     }
 
@@ -326,40 +319,8 @@
       sYdiff = (sYdiff == null) ? yDiff : PARAMS.alphaYdiff * yDiff + (1 - PARAMS.alphaYdiff) * sYdiff;
       sNoseZ = (sNoseZ == null) ? noseZ : PARAMS.alphaNoseZ * noseZ + (1 - PARAMS.alphaNoseZ) * sNoseZ;
 
-      // 3秒キャリブモード中：サンプルを蓄積
-      if (calibMode) {
-        calibSamples.push({ y: sYdiff, z: sNoseZ });
-
-        if (now - calibStartTs >= 3000) {
-          calibMode = false;
-          if (calibSamples.length > 0) {
-            const sum = calibSamples.reduce((acc, v) => {
-              acc.y += v.y;
-              acc.z += v.z;
-              return acc;
-            }, { y: 0, z: 0 });
-            const n = calibSamples.length;
-            PARAMS.calibYdiff = sum.y / n;
-            PARAMS.calibNoseZ = sum.z / n;
-            saveCalibration(PARAMS.calibYdiff, PARAMS.calibNoseZ);
-            setWarning(false, 'ニュートラルを登録しました');
-          } else {
-            setWarning(true, 'キャリブに失敗しました（サンプル0件）');
-          }
-        }
-
-        // キャリブ中は判定・ログはスキップ
-        if (calibMode) {
-          output.textContent =
-            `キャリブレーション中...\n` +
-            `yDiff(平滑): ${sYdiff.toFixed(4)}\n` +
-            `noseZ(平滑): ${sNoseZ.toFixed(4)}`;
-          return;
-        }
-      }
-
       // 顔向き & 距離の分類
-      const dir = classifyDirection();     // ← ここを調整
+      const dir = classifyDirection();
       faceState.dir = dir;
       const prox = classifyProximity(sNoseZ);
       faceState.prox = prox;
@@ -376,7 +337,7 @@
         `Roll:  ${sRoll.toFixed(2)}°\n` +
         `yDiff(平滑): ${sYdiff.toFixed(4)}\n` +
         `noseZ(平滑): ${sNoseZ.toFixed(4)}\n` +
-        `combined: ${combined.toFixed(4)}\n` +
+        `combined(y+z): ${combined.toFixed(4)}\n` +
         `顔向き: ${faceState.dir}\n` +
         `顔距離: ${faceState.prox}`;
 
@@ -390,58 +351,30 @@
       ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
     }
 
-    // combined をデバッグ用に返す
+    // combined(y+z) を返す（キャリブ有無に対応）
     function getCombinedForDebug(){
       if (PARAMS.calibYdiff != null && PARAMS.calibNoseZ != null){
         return (sYdiff - PARAMS.calibYdiff) + (sNoseZ - PARAMS.calibNoseZ);
       }
-      // キャリブなし：実際に判定に使う combined と同じもの
       return (sYdiff ?? 0) + (sNoseZ ?? 0);
     }
 
-    // 顔向き判定ロジック
+    // 顔向き：yDiff + noseZ で判定（ヒステリシス）
     function classifyDirection() {
       const band = PARAMS.absExitBand ?? 0.02;
+      let combined;
 
-      // ★ キャリブ済みの場合：元のロジックそのまま
       if (PARAMS.calibYdiff != null && PARAMS.calibNoseZ != null){
-        let combined = (sYdiff - PARAMS.calibYdiff) + (sNoseZ - PARAMS.calibNoseZ);
-
-        if (!wasDown && combined < -0.04) { wasDown = true; wasUp = false; return 'down'; }
-        if (wasDown && combined > -0.04 + band) { wasDown = false; }
-
-        if (!wasUp && combined > 0.05) { wasUp = true; wasDown = false; return 'up'; }
-        if (wasUp && combined < 0.05 - band) { wasUp = false; }
-
-        if (wasDown) return 'down';
-        if (wasUp)   return 'up';
-        return 'straight';
+        combined = (sYdiff - PARAMS.calibYdiff) + (sNoseZ - PARAMS.calibNoseZ);
+      } else {
+        combined = (sYdiff ?? 0) + (sNoseZ ?? 0);
       }
 
-      // ★ キャリブ無しの場合：しきい値を広くして「ほぼ straight」にする
-      const combined = (sYdiff ?? 0) + (sNoseZ ?? 0);
-      const downTh = -0.06;   // これよりかなり小さいと down
-      const upTh   =  0.12;   // これよりかなり大きいと up
+      if (!wasDown && combined < -0.04) { wasDown = true; wasUp = false; return 'down'; }
+      if (wasDown && combined > -0.04 + band) { wasDown = false; }
 
-      // down 判定
-      if (!wasDown && combined < downTh) {
-        wasDown = true;
-        wasUp = false;
-        return 'down';
-      }
-      if (wasDown && combined > downTh + band) {
-        wasDown = false;
-      }
-
-      // up 判定
-      if (!wasUp && combined > upTh) {
-        wasUp = true;
-        wasDown = false;
-        return 'up';
-      }
-      if (wasUp && combined < upTh - band) {
-        wasUp = false;
-      }
+      if (!wasUp && combined > 0.05) { wasUp = true; wasDown = false; return 'up'; }
+      if (wasUp && combined < 0.05 - band) { wasUp = false; }
 
       if (wasDown) return 'down';
       if (wasUp)   return 'up';
@@ -477,16 +410,8 @@
       return (dir === 'down');
     }
 
-    // キャリブ中は判定しない・ビープ止める
+    // 表示は毎フレーム bentState に同期
     function updateSustain(isNow){
-      if (calibMode) {
-        bentState = false;
-        enterStart = exitStart = null;
-        stopBeepLoop();
-        setWarning(false, 'キャリブレーション中: 良い姿勢で3秒間静止してください');
-        return;
-      }
-
       const t = performance.now();
       if (isNow) {
         if (enterStart == null) enterStart = t;
@@ -511,11 +436,6 @@
       if (faceDetected) {
         setWarning(bentState, bentState ? '首が曲がっています' : '首は曲がっていません');
       }
-    }
-
-    function refreshWarningNow(){
-      if (!faceDetected) return;
-      setWarning(bentState, bentState ? '首が曲がっています' : '首は曲がっていません');
     }
 
     function setWarning(bad, text){
@@ -547,17 +467,13 @@
       }
 
       await initCamera();
+      ensureAudio();
 
       // 状態リセット
       wasDown = wasUp = wasClose = wasFar = false;
       bentState = false;
       enterStart = exitStart = null;
       stopBeepLoop();
-      calibMode = false;
-      calibSamples = [];
-      calibStartTs = 0;
-
-      ensureAudio();
 
       camera = new Camera(video, {
         onFrame: async () => {
@@ -574,14 +490,11 @@
 
       const saved = loadCalibration();
       if (saved) {
-        PARAMS.calibYdiff = saved.y;
-        PARAMS.calibNoseZ = saved.z;
-        setWarning(false, '測定中...');
+        PARAMS.calibYdiff = saved.y; PARAMS.calibNoseZ = saved.z;
       } else {
-        PARAMS.calibYdiff = null;
-        PARAMS.calibNoseZ = null;
-        setWarning(false, '測定中...');
+        PARAMS.calibYdiff = null; PARAMS.calibNoseZ = null;
       }
+      setWarning(false, '測定中...');
 
       document.addEventListener('visibilitychange', () => {
         if (!camera) return;
@@ -594,23 +507,16 @@
       }, { passive: true });
     }
 
-    // 3秒平均キャリブ
+    // キャリブ：その瞬間の sYdiff / sNoseZ を保存（(1)と同じ）
     function calibrate(){
-      if (sYdiff == null || sNoseZ == null) {
-        setWarning(true, 'まだ値が安定していません。数秒待ってからもう一度試してください');
-        return;
-      }
-      calibMode = true;
-      calibSamples = [];
-      calibStartTs = performance.now();
-      setWarning(false, '良い姿勢で3秒間そのまま静止してください');
+      if (sYdiff == null || sNoseZ == null) return;
+      PARAMS.calibYdiff = sYdiff; PARAMS.calibNoseZ = sNoseZ;
+      saveCalibration(PARAMS.calibYdiff, PARAMS.calibNoseZ);
+      setWarning(false, 'ニュートラルを登録しました');
     }
 
     function resetCalibration(){
       PARAMS.calibYdiff = null; PARAMS.calibNoseZ = null;
-      calibMode = false;
-      calibSamples = [];
-      calibStartTs = 0;
       localStorage.removeItem('posture-calib');
       setWarning(false, 'キャリブを解除しました');
     }
